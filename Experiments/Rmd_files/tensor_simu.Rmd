@@ -1,0 +1,341 @@
+---
+title: "tensor_simu"
+output: html_document
+date: "2022-12-15"
+---
+
+# 数据生成    
+
+## 缺失机制   
+
+本设定缺失机制是可以随机缺失某个x切片的部分数据，但每个切片缺失数目有一定范围(本机制限定是每个切片数量的10%到20%)。而对有缺失的x切片，缺失发生在固定的区域，即发生在y轴的后半部分和z轴（时间Tx轴）的后半部分，即缺失的y从floor(p2/2):p2中抽样，缺失的z从floor(Tx/2):Tx中抽样。    
+
+```{r}
+MCAR<-function(X,rate){   #tensorX，维度为p1*p2*Tx，rate为缺失率
+  p1<-dim(X)[1];p2<-dim(X)[2];Tx<-dim(X)[3]
+  missnum<-floor(p1*p2*Tx*rate)   #总缺失数
+  count_total<-0
+  xindex<-sample(1:p1,size=p1)   #打乱x索引顺序
+  for(x in xindex){
+    miss<-sample(floor(p2*Tx*0.1):floor(p2*Tx*0.2),size=1)  
+    #抽取这一x切片缺失数
+    count_piece<-0
+    if((count_total+miss)>missnum) {   #超出缺失数的情况
+      miss<-missnum-count_total   #最后一个切片只缺失这么多
+      yindex<-sample(floor(p2/2):p2,size=length(floor(p2/2):p2))    #打乱y索引
+      for(y in yindex){
+        missz<-sample((Tx*0.4):(Tx*0.5),size=1)
+        if((count_piece+missz)>miss){
+          missz<-miss-count_piece
+          zindex<-sample(floor(Tx/2):Tx,size=missz)     #缺失z索引
+          X[x,y,zindex]<-NA
+          break
+        }
+        else{
+          zindex<-sample(floor(Tx/2):Tx,size=missz)     #缺失z索引
+          X[x,y,zindex]<-NA
+        }
+        count_piece<-count_piece+missz
+      }
+      break    #停止循环
+    }
+    else{
+      yindex<-sample(floor(p2/2):p2,size=length(floor(p2/2):p2))    #打乱后半部分y索引
+      for(y in yindex){
+        missz<-sample((Tx*0.4):(Tx*0.5),size=1)
+        if((count_piece+missz)>miss){
+          missz<-miss-count_piece
+          zindex<-sample(floor(Tx/2):Tx,size=missz)     #缺失z索引
+          X[x,y,zindex]<-NA
+          break
+        }
+        else{
+          zindex<-sample(floor(Tx/2):Tx,size=missz)     #缺失z索引，集中在T大的部分
+          X[x,y,zindex]<-NA
+        }
+        count_piece<-count_piece+missz
+      }
+     
+    }
+    count_total<-count_total+miss    #累计缺失数递增
+  }
+  return(X)
+}
+```   
+
+## tensor生成       
+
+### Ft  
+
+生成AR(1)     
+
+```{R}
+ar1.gen <- function(n, coeff, sigma=1.0, n0=1000,
+                   x0=numeric(length(coeff))){
+  n2 <- n0 + n    #从这里开始取
+  eps <- rnorm(n2, 0, sigma)
+  x2 <- filter(eps, coeff, method="recursive", side=1, init=x0)
+  x <- x2[(n0+1):n2]
+  x <- ts(x)
+  attr(x, "model") <- "AR(1)"
+  attr(x, "coefficients") <- coeff
+  attr(x, "sigma") <- sigma
+  return(x)
+}
+```
+
+生成Ft    
+
+```{R}
+Ft_gen<-function(k1,k2,coeffs,Tx){
+  #dim(Ft)=(k1,k2),coeffs是Ft对应AR过程的系数矩阵
+  FT<-array(rep(0,k1*k2*Tx),dim = c(k1,k2,Tx))
+  for(i in 1:k1){
+    for(j in 1:k2){
+      FT[i,j,1:Tx]<-ar1.gen(n=Tx,coeff =coeffs[i,j],sigma=1)[1]
+    }
+  }
+  return(FT)
+}
+```
+
+### loadings   
+
+```{r}
+loading_gen<-function(p,k,delta){
+  #p=(p1,p2),k=(k1,k2),delta=(delta1,delta2)
+  #返回列表记录R,C
+  p1<-p[1];p2<-p[2]
+  k1<-k[1];k2<-k[2]
+  delta1<-delta[1];delta2<-delta[2]
+  R<-matrix(runif(p1*k1,-p1^(-delta1/2),p1^(-delta1/2)),nrow=p1,byrow=TRUE)
+  C<-matrix(runif(p2*k2,-p2^(-delta2/2),p2^(-delta2/2)),nrow=p2,byrow=TRUE)
+  
+  loading<-list()
+  loading$R<-R
+  loading$C<-C
+  return(loading)
+}
+```
+
+### Et     
+
+```{r}
+library("mvtnorm")
+Et_gen<-function(p){
+  p1<-p[1];p2<-p[2]
+  Gamma1<-matrix(rep(0.2,p1*p1),nrow=p1,byrow=TRUE)
+  Gamma2<-matrix(rep(0.2,p2*p2),nrow=p2,byrow=TRUE)
+  
+  Gamma1<-Gamma1+diag(0.8,nrow=p1,ncol=p1)
+  Gamma2<-Gamma2+diag(0.8,nrow=p2,ncol=p2)
+  
+  Sigma<-kronecker(Gamma2,Gamma1)
+  vec_Et<-rmvnorm(n=1,mean=rep(0,p1*p2),sigma=Sigma)
+  Et<-matrix(vec_Et,nrow=p1,byrow=FALSE)
+  return(Et)
+}
+```
+
+## 生成模拟数据   
+
+本tensor数据生成采用了JoE 2019 Factor models for matrix-valued high-dimensional time series 一文中的生成方法，生成三维tensor数据，模型为   
+$$
+X_t=RF_tC^{'}+E_t,t=1,...,T
+$$   
+   
+这里$F_t$是$k_1 \times k_2$公共基础因子的未观测矩阵值时间序列（unobserved matrix-valued time series of common fundamental factors），R是$p_1 \times k_1$前载荷矩阵，C是$p_2 \times k_2$后载荷矩阵。    
+而模拟过程数据设定如下：    
+$$
+\begin{aligned}
+&dim(F_t)=(k_1,k_2)=(3,2)   \\
+&F_t \sim AR(1)   \\
+&R,C \sim U(-p_i^{-\delta_i/2},p_i^{-\delta_i/2}),i=1,2   \\
+&E_t \sim WN(0,\Sigma),Cov(vec(E_t))=\Gamma_2 \otimes \Gamma_1,\Gamma_i \in R^{p_i \times p_i}    \\
+\end{aligned}
+$$
+其中AR coefficients=[−0.5 0.6; 0.8 − 0.4; 0.7 0.3]，$\Gamma_i$对角元为1，非对角元为0.2。    
+生成完整数据后，数据缺失参考前面缺失机制部分。    
+
+```{r}
+DGP<-function(p,k,Tx,coeff,delta,rate){
+  #生成数据
+  out<-list()
+  p1<-p[1];p2<-p[2]
+  k1<-k[1];k2<-k[2]
+  X<-array(rep(0,p1*p2*Tx),dim=c(p1,p2,Tx))
+  
+  FT<-Ft_gen(k1,k2,coeff,Tx)
+  for(t in 1:Tx){
+    Ft<-as.matrix(FT[,,t])
+    load<-loading_gen(p,k,delta)
+    R<-load$R
+    C<-load$C
+    Et<-Et_gen(p)
+
+    X[,,t]<-R%*%Ft%*%t(C)+Et
+  }
+  
+  #数据缺失
+  X_miss<-X
+  X_miss<-MCAR(X_miss,rate)
+  
+  out$X_complete<-X
+  out$X_miss<-X_miss
+  return(out)
+}
+```
+
+
+# 数据模拟     
+
+## 切片模拟函数   
+
+```{r}
+library("fbi")
+simu<-function(X,r,flag){   
+  #flag=1即沿x轴切，flag=2即沿y轴切，flag=3沿z轴切
+  #输入：X是有缺失值的矩阵，r是切片因子向量的维度，flag是沿何方向切片的标志
+  #输出：返回插补后的tensor-X_imputed
+  p<-dim(X)   #维度
+  X_imputed<-array(rep(0,p[1]*p[2]*p[3]),dim=c(p[1],p[2],p[3]))
+  if(flag==1){
+    for(x in 1:p[1]){
+      X_piece_x<-t(as.matrix(X[x,,]))   #Tx*p2
+      out<-fbi::tw_apc(X_piece_x,kmax=r,center=FALSE,standardize = FALSE,re_estimate = TRUE)
+      X_imputed[x,,]<-t(out$data)   #插补后的矩阵
+    }
+  }
+  if(flag==2){
+    for(y in 1:p[2]){
+      X_piece_y<-t(as.matrix(X[,y,]))
+      out<-fbi::tw_apc(X_piece_y,kmax=r,center=FALSE,standardize = FALSE,re_estimate = TRUE)
+      X_imputed[,y,]<-t(out$data)   #插补后的矩阵
+    }
+  }
+  if(flag==3){
+    for(z in 1:p[3]){
+      X_piece_z<-as.matrix(X[,,z])
+      out<-fbi::tw_apc(X_piece_z,kmax=r,center=FALSE,standardize = FALSE,re_estimate = TRUE)
+      X_imputed[,,z]<-out$data   #插补后的矩阵
+    }
+  }
+  return(X_imputed)
+}
+```
+
+## 评价指标    
+
+这里评价指标取平均的平均数是缺失数据数目，考虑到X_hat只插补了缺失值。    
+
+```{r}
+RMSE<-function(X_hat,data){
+  X<-data$X_complete
+  X_miss<-data$X_miss
+  dimension<-dim(X)[1]*dim(X)[2]*dim(X)[3]
+  missnum<-sum(is.na(X_miss))
+  return(sqrt(sum((X_hat-X)^2)/missnum))
+}
+```
+
+## 模拟   
+
+数据总共100000个，缺失5%和7.5%（即缺失5000/7500个数据），且缺失数据分布较为集中（见前面缺失机制部分叙述）。    
+这种数据的现实例子：有$p_2$支股票，每支股票有$p_1$个指标（盈利率等），时间维度是$T$维，但是对某些股票（可以人为放在y维度后半部分）的某些指标（某些缺失的x切片），由于股票退市（T维度较大值）等因素缺失（类似地，可以修改y轴缺失的设定模拟某些股票早期的指标数据），现插补这些股票的缺失值用作案例分析等。    
+
+```{r}
+#初始值设定
+k<-c(3,2)
+coe<-matrix(c(-0.5,0.6,0.8,-0.4,0.7,0.3),nrow=3,byrow=TRUE)
+p<-c(20,50)   #可变
+delta<-c(0.5,0.5)   #可变
+Tx<-0.1*p[1]*p[2]   #可变
+repeats<-30 
+
+rmse<-matrix(rep(0,12),nrow=3,byrow=TRUE)
+evaluation<-data.frame("dim"=c("(20,50,100)","(20,50,100)","(20,50,100)"),"missrate"=c("2.5%","5%","7.5%"),"all"=c(0,0,0),"x_piece"=c(0,0,0),"y_piece"=c(0,0,0),"z_piece"=c(0,0,0))
+#模拟
+#cur.time <- Sys.time()
+#缺失2.5%
+for(number in 1:repeats){
+  #生成数据
+  data1<-DGP(p,k,Tx,coe,delta,rate=0.025)
+  X_complete<-data1$X_complete
+  X_miss<-data1$X_miss
+  
+  #插补含缺失值的矩阵
+  #切片p2p3
+  X1<-simu(X_miss,r=2,flag=1)
+  #切片p1p3
+  X2<-simu(X_miss,r=2,flag=2)
+  #切片p1p2
+  X3<-simu(X_miss,r=2,flag=3)
+
+  #取均值作为插补估计值
+  X_hat<-(X1+X2+X3)/3
+
+  #计算误差指标
+  rmse[1,1]<-rmse[1,1]+RMSE(X_hat,data1)
+  rmse[1,2]<-rmse[1,2]+RMSE(X1,data1)
+  rmse[1,3]<-rmse[1,3]+RMSE(X2,data1)
+  rmse[1,4]<-rmse[1,4]+RMSE(X3,data1)
+}
+
+#缺失5%
+for(number in 1:repeats){
+  #生成数据
+  data1<-DGP(p,k,Tx,coe,delta,rate=0.05)
+  X_complete<-data1$X_complete
+  X_miss<-data1$X_miss
+  
+  #插补含缺失值的矩阵
+  #切片p2p3
+  X1<-simu(X_miss,r=2,flag=1)
+  #切片p1p3
+  X2<-simu(X_miss,r=2,flag=2)
+  #切片p1p2
+  X3<-simu(X_miss,r=2,flag=3)
+
+  #取均值作为插补估计值
+  X_hat<-(X1+X2+X3)/3
+
+  #计算误差指标
+  rmse[2,1]<-rmse[2,1]+RMSE(X_hat,data1)
+  rmse[2,2]<-rmse[2,2]+RMSE(X1,data1)
+  rmse[2,3]<-rmse[2,3]+RMSE(X2,data1)
+  rmse[2,4]<-rmse[2,4]+RMSE(X3,data1)
+}
+
+
+#缺失7.5%
+for(number in 1:repeats){
+  #生成数据
+  data2<-DGP(p,k,Tx,coe,delta,rate=0.075)
+  X_complete<-data2$X_complete
+  X_miss<-data2$X_miss
+  
+  #插补含缺失值的矩阵
+  #切片p2p3
+  X1<-simu(X_miss,r=2,flag=1)
+  #切片p1p3
+  X2<-simu(X_miss,r=2,flag=2)
+  #切片p1p2
+  X3<-simu(X_miss,r=2,flag=3)
+
+  #取均值作为插补估计值
+  X_hat<-(X1+X2+X3)/3
+
+  #计算误差指标
+  rmse[3,1]<-rmse[3,1]+RMSE(X_hat,data2)
+  rmse[3,2]<-rmse[3,2]+RMSE(X1,data2)
+  rmse[3,3]<-rmse[3,3]+RMSE(X2,data2)
+  rmse[3,4]<-rmse[3,4]+RMSE(X3,data2)
+}
+#Sys.time() - cur.time
+rmse<-round(rmse/repeats,4)
+evaluation[1,3:6]<-rmse[1,1:4]
+evaluation[2,3:6]<-rmse[2,1:4]
+evaluation[3,3:6]<-rmse[3,1:4]
+cat("插补后的补全矩阵和原矩阵间RMSE为","\n")
+print(evaluation)
+```
